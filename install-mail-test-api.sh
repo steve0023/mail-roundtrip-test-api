@@ -94,32 +94,42 @@ send_email() {
     log "Server: $host:$port"
     log "TLS Mode: ${tls_mode:-none}"
     
+    # Build base swaks command
     local swaks_cmd="swaks --to \"$IMAP_USER\" --from \"$from_addr\" --server \"$host:$port\" --header \"Subject: $subject\" --body \"Round-trip test\" --timeout \"$SMTP_TIMEOUT\""
     
+    # Add TLS options based on tls_mode parameter
     case "${tls_mode,,}" in
         tls|starttls)
             debug "Using STARTTLS"
             swaks_cmd="$swaks_cmd --tls"
             ;;
         tlsc|implicit|smtps)
-            debug "Using implicit TLS"
+            debug "Using implicit TLS (SMTPS)"
             swaks_cmd="$swaks_cmd --tlsc"
             ;;
         none|"")
-            debug "No TLS"
+            debug "No TLS (plain text)"
             ;;
     esac
-    
+
+    # Add authentication if provided
     if [[ -n "$smtp_user" && -n "$smtp_pass" ]]; then
-        debug "Using authentication"
+        debug "Using authentication (user: $smtp_user)"
         swaks_cmd="$swaks_cmd --auth LOGIN --auth-user \"$smtp_user\" --auth-password \"$smtp_pass\""
+    else
+        debug "No authentication (relay mode)"
     fi
     
+    # Execute swaks command
     local swaks_output
     swaks_output=$(eval "$swaks_cmd" 2>&1)
     local exit_code=$?
     
     if [[ $DEBUG -eq 1 ]]; then
+        log "=== SWAKS COMMAND ==="
+        # Sanitize password for logging
+        local safe_cmd="${swaks_cmd//$smtp_pass/**REDACTED**}"
+        log "$safe_cmd"
         log "=== SWAKS OUTPUT ==="
         echo "$swaks_output" >> "$LOG_FILE"
         log "=== END SWAKS OUTPUT ==="
@@ -134,6 +144,7 @@ send_email() {
     fi
 }
 
+# IMAP check using curl with retry logic
 check_imap() {
     local subject="$1"
     
@@ -143,19 +154,22 @@ check_imap() {
     
     log "Searching for subject: $subject"
     debug "IMAP: imaps://$IMAP_HOST:$IMAP_PORT"
-    
+    debug "User: $IMAP_USER"
+
+    # Retry loop for IMAP search - USE LOCAL VARIABLE
     local attempt=1
     local search_result=""
     local curl_exit=0
-    local current_delay=$RETRY_DELAY
+    local current_delay=$RETRY_DELAY  # LOCAL copy
     
     while [[ $attempt -le $MAX_RETRIES ]]; do
         if [[ $attempt -gt 1 ]]; then
             log "Retry attempt $attempt/$MAX_RETRIES after ${current_delay}s..."
             sleep "$current_delay"
-            current_delay=$((current_delay * 2))
+            current_delay=$((current_delay * 2))  # Exponential backoff on LOCAL variable
         fi
         
+        # Use curl to search IMAP
         search_result=$(curl --silent --max-time "$IMAP_TIMEOUT" \
             --url "imaps://$IMAP_HOST:$IMAP_PORT/INBOX" \
             --user "$IMAP_USER:$IMAP_PASS" \
@@ -164,28 +178,30 @@ check_imap() {
         curl_exit=$?
         debug "Curl exit code (attempt $attempt): $curl_exit"
         
+        # Exit code 0 = success, break the retry loop
         if [[ $curl_exit -eq 0 ]]; then
             break
         fi
         
+        # Log the error
         case $curl_exit in
-            6) log "⚠ DNS resolution failed" ;;
-            7) log "⚠ Failed to connect to IMAP" ;;
-            28) log "⚠ Connection timeout" ;;
-            *) log "⚠ Curl error: $curl_exit" ;;
+            6) log "⚠ DNS resolution failed for $IMAP_HOST" ;;
+            7) log "⚠ Failed to connect to $IMAP_HOST:$IMAP_PORT" ;;
+            28) log "⚠ Connection timeout after ${IMAP_TIMEOUT}s" ;;
+            *) log "⚠ Curl error: exit code $curl_exit" ;;
         esac
         
         attempt=$((attempt + 1))
     done
     
     if [[ $DEBUG -eq 1 ]]; then
-        log "=== CURL SEARCH RESULT ==="
+        log "=== CURL SEARCH RESULT (after $((attempt-1)) attempts) ==="
         echo "$search_result" >> "$LOG_FILE"
         log "=== END SEARCH RESULT ==="
     fi
     
     if [[ $curl_exit -ne 0 ]]; then
-        log "✗ IMAP connection failed after $MAX_RETRIES attempts"
+        log "✗ IMAP connection failed after $MAX_RETRIES attempts (curl exit: $curl_exit)"
         return 1
     fi
     
@@ -198,22 +214,24 @@ check_imap() {
     fi
     
     if [[ -z "$msg_id" || ! "$msg_id" =~ ^[0-9]+$ ]]; then
-        log "✗ No messages found"
+        log "✗ No messages found with subject: $subject"
         return 1
     fi
     
     log "✓ Message found: ID=$msg_id"
-    log "Deleting message..."
+    
+    # Delete the message using curl (with retry) - USE LOCAL VARIABLE
+    log "Deleting message ID: $msg_id"
     
     attempt=1
-    current_delay=$RETRY_DELAY
+    current_delay=$RETRY_DELAY  # Reset LOCAL copy
     local delete_success=0
     
     while [[ $attempt -le $MAX_RETRIES ]]; do
         if [[ $attempt -gt 1 ]]; then
             debug "Delete retry attempt $attempt/$MAX_RETRIES"
             sleep "$current_delay"
-            current_delay=$((current_delay * 2))
+            current_delay=$((current_delay * 2))  # Exponential backoff on LOCAL variable
         fi
         
         local delete_result
@@ -232,7 +250,8 @@ check_imap() {
                 echo "$delete_result" >> "$LOG_FILE"
                 log "=== END DELETE RESULT ==="
             fi
-            
+
+            # Expunge to permanently delete
             curl --silent --max-time "$IMAP_TIMEOUT" \
                 --url "imaps://$IMAP_HOST:$IMAP_PORT/INBOX" \
                 --user "$IMAP_USER:$IMAP_PASS" \
@@ -246,9 +265,9 @@ check_imap() {
     done
     
     if [[ $delete_success -eq 1 ]]; then
-        log "✓ Message deleted"
+        log "✓ Message deleted successfully"
     else
-        log "⚠ Delete failed (message may remain in inbox)"
+        log "⚠ Message deletion failed after $MAX_RETRIES attempts (message may remain in inbox)"
     fi
     
     return 0
@@ -264,21 +283,28 @@ process_test() {
     local subject=$(generate_subject)
     
     log "========================================"
-    log "=== TEST: $host:$port ==="
+    log "=== NEW TEST REQUEST ==="
+    log "Host: $host:$port"
+    log "SMTP User: $smtp_user"
+    log "TLS Mode: ${tls_mode:-none}"
+    log "Generated Subject: $subject"
     log "========================================"
     
     if send_email "$host" "$port" "$smtp_user" "$smtp_pass" "$subject" "$tls_mode"; then
         if check_imap "$subject"; then
-            echo "SUCCESS: Email round-trip completed via $host:$port"
-            log "✓ Test successful"
+            local msg="SUCCESS: Email round-trip completed via $host:$port (${WAIT_TIME}s delay)"
+            log "$msg"
+            echo "$msg"
             return 0
         fi
-        echo "FAILED: Email sent but not received within ${WAIT_TIME}s"
-        log "✗ Not received"
+        local msg="FAILED: Email sent but not received within ${WAIT_TIME}s"
+        log "$msg"
+        echo "$msg"
         return 1
     fi
-    echo "FAILED: Could not send email"
-    log "✗ Send failed"
+    local msg="FAILED: Could not send email via SMTP"
+    log "$msg"
+    echo "$msg"
     return 1
 }
 
@@ -294,7 +320,7 @@ handle_request() {
     done
     
     if [[ "$request" =~ GET\ /test\?([^\ ]+) ]]; then
-        local query="${BASH_REMATCH[^1]}"
+        local query="${BASH_REMATCH[1]}"
         
         IFS='&' read -ra PARAMS <<< "$query"
         for param in "${PARAMS[@]}"; do
@@ -324,7 +350,7 @@ handle_request() {
         
         printf "HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: ${#result}\r\nConnection: close\r\n\r\n%s" "$status" "$result"
     else
-        local body="ERROR: Use /test endpoint"
+        local body="ERROR: Use /test endpoint with host and port parameters"
         printf "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ${#body}\r\nConnection: close\r\n\r\n%s" "$body"
     fi
 }
@@ -334,6 +360,13 @@ start_server() {
     log "=== Mail Test API Starting ==="
     log "Port: $PORT"
     log "IMAP: $IMAP_USER @ imaps://$IMAP_HOST:$IMAP_PORT"
+    log "Wait time: ${WAIT_TIME}s"
+    log "Max retries: $MAX_RETRIES"
+    log "Retry delay: ${RETRY_DELAY}s (exponential backoff)"
+    log "SMTP timeout: ${SMTP_TIMEOUT}s"
+    log "IMAP timeout: ${IMAP_TIMEOUT}s"
+    log "Debug mode: $DEBUG"
+    log "Using curl for IMAP"
     log "========================================"
     
     if ! command -v ncat >/dev/null 2>&1; then

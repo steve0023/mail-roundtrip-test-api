@@ -53,7 +53,7 @@ sudo ./install-mail-test-api.sh
 1. **Install dependencies:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y nmap swaks curl openssl
+sudo apt-get install -y ncat swaks curl openssl
 ```
 
 2. **Create the main script** at `/usr/local/bin/mail-test-api.sh` (copy the complete script from the installer install-mail-test-api.sh, between `EOFSCRIPT` markers)

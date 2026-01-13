@@ -16,7 +16,7 @@ fi
 # Install dependencies
 echo "Step 1: Installing dependencies..."
 apt-get update
-apt-get install -y nmap swaks curl openssl
+apt-get install -y ncat swaks curl openssl
 
 # Get configuration
 echo ""

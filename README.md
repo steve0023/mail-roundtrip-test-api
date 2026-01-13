@@ -41,7 +41,7 @@ Key features:
 ### Method 1: Automated Install Script
 
 ```bash
-wget https://raw.githubusercontent.com/steve0023/mail-roundtrip-test-api/main/install-mail-test-api.sh
+wget https://raw.githubusercontent.com/steve0023/mail-roundtrip-test-api/refs/heads/main/install-mail-test-api.sh
 chmod +x install-mail-test-api.sh
 sudo ./install-mail-test-api.sh
 ```

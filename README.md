@@ -41,7 +41,7 @@ Key features:
 ### Method 1: Automated Install Script
 
 ```bash
-wget adr
+wget https://raw.githubusercontent.com/steve0023/mail-roundtrip-test-api/main/install-mail-test-api.sh
 chmod +x install-mail-test-api.sh
 sudo ./install-mail-test-api.sh
 ```
@@ -56,7 +56,7 @@ sudo apt-get update
 sudo apt-get install -y nmap swaks curl openssl
 ```
 
-2. **Create the main script** at `/usr/local/bin/mail-test-api.sh` (copy the complete script from the installer above, between `EOFSCRIPT` markers)
+2. **Create the main script** at `/usr/local/bin/mail-test-api.sh` (copy the complete script from the installer install-mail-test-api.sh, between `EOFSCRIPT` markers)
 3. **Edit configuration** in the script:
 ```bash
 sudo nano /usr/local/bin/mail-test-api.sh

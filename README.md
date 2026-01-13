@@ -329,7 +329,3 @@ sudo rm /var/log/mail-test-api.log
 sudo systemctl daemon-reload
 ```
 
-## License
-
-MIT License - Feel free to modify and distribute.
-

@@ -13,10 +13,15 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# Function to escape special characters for sed
+escape_sed() {
+    echo "$1" | sed 's/[&/\]/\\&/g'
+}
+
 # Install dependencies
 echo "Step 1: Installing dependencies..."
 apt-get update
-apt-get install -y ncat swaks curl openssl
+apt-get install -y nmap swaks curl openssl
 
 # Get configuration
 echo ""
@@ -27,10 +32,17 @@ IMAP_HOST=${IMAP_HOST:-imap.gmail.com}
 read -p "IMAP port [^993]: " IMAP_PORT
 IMAP_PORT=${IMAP_PORT:-993}
 read -p "IMAP username/email: " IMAP_USER
-read -s -p "IMAP password: " IMAP_PASS
+read -s -p "IMAP password: " IMAP_PASS           #PARSING ERROR TO FIX "&" CARS
 echo ""
 read -p "API port [^8081]: " API_PORT
 API_PORT=${API_PORT:-8081}
+
+# Escape special characters in variables
+IMAP_HOST_SAFE=$(escape_sed "$IMAP_HOST")
+IMAP_PORT_SAFE=$(escape_sed "$IMAP_PORT")
+IMAP_USER_SAFE=$(escape_sed "$IMAP_USER")
+IMAP_PASS_SAFE=$(escape_sed "$IMAP_PASS")
+API_PORT_SAFE=$(escape_sed "$API_PORT")
 
 # Create main script
 echo ""
@@ -386,12 +398,12 @@ case "${1:-}" in
 esac
 EOFSCRIPT
 
-# Replace placeholders
-sed -i "s/PORT=8081/PORT=$API_PORT/" /usr/local/bin/mail-test-api.sh
-sed -i "s/IMAP_HOST=\"imap.gmail.com\"/IMAP_HOST=\"$IMAP_HOST\"/" /usr/local/bin/mail-test-api.sh
-sed -i "s/IMAP_PORT=993/IMAP_PORT=$IMAP_PORT/" /usr/local/bin/mail-test-api.sh
-sed -i "s/IMAP_USER=\"user@example.com\"/IMAP_USER=\"$IMAP_USER\"/" /usr/local/bin/mail-test-api.sh
-sed -i "s/IMAP_PASS=\"password\"/IMAP_PASS=\"$IMAP_PASS\"/" /usr/local/bin/mail-test-api.sh
+# Replace placeholders with escaped values
+sed -i "s/PORT=8081/PORT=$API_PORT_SAFE/" /usr/local/bin/mail-test-api.sh
+sed -i "s/IMAP_HOST=\"imap.gmail.com\"/IMAP_HOST=\"$IMAP_HOST_SAFE\"/" /usr/local/bin/mail-test-api.sh
+sed -i "s/IMAP_PORT=993/IMAP_PORT=$IMAP_PORT_SAFE/" /usr/local/bin/mail-test-api.sh
+sed -i "s/IMAP_USER=\"user@example.com\"/IMAP_USER=\"$IMAP_USER_SAFE\"/" /usr/local/bin/mail-test-api.sh
+sed -i "s/IMAP_PASS=\"password\"/IMAP_PASS=\"$IMAP_PASS_SAFE\"/" /usr/local/bin/mail-test-api.sh
 
 chmod +x /usr/local/bin/mail-test-api.sh
 

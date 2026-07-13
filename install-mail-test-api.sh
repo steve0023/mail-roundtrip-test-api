@@ -56,10 +56,12 @@ IMAP_PORT=993
 IMAP_USER="user@example.com"
 IMAP_PASS="password"
 WAIT_TIME=10
-MAX_RETRIES=3
+MAX_RETRIES=6
 RETRY_DELAY=10
+MAX_RETRY_DELAY=30
 SMTP_TIMEOUT=30
 IMAP_TIMEOUT=15
+READ_TIMEOUT=10
 LOG_FILE="/var/log/mail-test-api.log"
 DEBUG=0
 
@@ -168,65 +170,78 @@ check_imap() {
     debug "IMAP: imaps://$IMAP_HOST:$IMAP_PORT"
     debug "User: $IMAP_USER"
 
-    # Retry loop for IMAP search - USE LOCAL VARIABLE
+    # Retry loop for IMAP search.
+    # Retries cover BOTH connection failures AND "message not delivered yet",
+    # so MAX_RETRIES/RETRY_DELAY actually control how long we wait for the
+    # round-trip. Backoff grows exponentially but is capped at MAX_RETRY_DELAY
+    # so the total window stays bounded and predictable.
+    local search_start=$SECONDS   # for reporting how long we actually waited
     local attempt=1
     local search_result=""
     local curl_exit=0
     local current_delay=$RETRY_DELAY  # LOCAL copy
-    
+    local msg_id=""
+
     while [[ $attempt -le $MAX_RETRIES ]]; do
         if [[ $attempt -gt 1 ]]; then
-            log "Retry attempt $attempt/$MAX_RETRIES after ${current_delay}s..."
+            log "Retry attempt $attempt/$MAX_RETRIES after ${current_delay}s (waiting for delivery)..."
             sleep "$current_delay"
             current_delay=$((current_delay * 2))  # Exponential backoff on LOCAL variable
+            [[ $current_delay -gt $MAX_RETRY_DELAY ]] && current_delay=$MAX_RETRY_DELAY
         fi
-        
+
         # Use curl to search IMAP
         search_result=$(curl --silent --max-time "$IMAP_TIMEOUT" \
             --url "imaps://$IMAP_HOST:$IMAP_PORT/INBOX" \
             --user "$IMAP_USER:$IMAP_PASS" \
             --request "SEARCH SUBJECT \"$subject\"" 2>&1)
-        
+
         curl_exit=$?
         debug "Curl exit code (attempt $attempt): $curl_exit"
-        
-        # Exit code 0 = success, break the retry loop
+
         if [[ $curl_exit -eq 0 ]]; then
-            break
+            # Connection succeeded; try to extract a message ID from the SEARCH result
+            if echo "$search_result" | grep -q "SEARCH"; then
+                msg_id=$(echo "$search_result" | grep "SEARCH" | grep -oE '[0-9]+' | head -1)
+                debug "Extracted message ID: '$msg_id'"
+            fi
+            # Found the message -> done. Otherwise fall through and retry:
+            # the email may simply not have arrived yet.
+            if [[ -n "$msg_id" && "$msg_id" =~ ^[0-9]+$ ]]; then
+                break
+            fi
+            debug "Search ran but message not found yet (attempt $attempt)"
+        else
+            # Log connection errors
+            case $curl_exit in
+                6) log "⚠ DNS resolution failed for $IMAP_HOST" ;;
+                7) log "⚠ Failed to connect to $IMAP_HOST:$IMAP_PORT" ;;
+                28) log "⚠ Connection timeout after ${IMAP_TIMEOUT}s" ;;
+                *) log "⚠ Curl error: exit code $curl_exit" ;;
+            esac
         fi
-        
-        # Log the error
-        case $curl_exit in
-            6) log "⚠ DNS resolution failed for $IMAP_HOST" ;;
-            7) log "⚠ Failed to connect to $IMAP_HOST:$IMAP_PORT" ;;
-            28) log "⚠ Connection timeout after ${IMAP_TIMEOUT}s" ;;
-            *) log "⚠ Curl error: exit code $curl_exit" ;;
-        esac
-        
+
         attempt=$((attempt + 1))
     done
-    
+
     if [[ $DEBUG -eq 1 ]]; then
-        log "=== CURL SEARCH RESULT (after $((attempt-1)) attempts) ==="
+        log "=== CURL SEARCH RESULT ==="
         echo "$search_result" >> "$LOG_FILE"
         log "=== END SEARCH RESULT ==="
     fi
-    
+
+    # Total seconds spent waiting for/searching the message (excludes initial WAIT_TIME).
+    CHECK_IMAP_ELAPSED=$((WAIT_TIME + SECONDS - search_start))
+
     if [[ $curl_exit -ne 0 ]]; then
         log "✗ IMAP connection failed after $MAX_RETRIES attempts (curl exit: $curl_exit)"
         return 1
     fi
-    
+
     log "✓ IMAP search completed"
-    
-    local msg_id=""
-    if echo "$search_result" | grep -q "SEARCH"; then
-        msg_id=$(echo "$search_result" | grep "SEARCH" | grep -oE '[0-9]+' | head -1)
-        debug "Extracted message ID: '$msg_id'"
-    fi
-    
+
     if [[ -z "$msg_id" || ! "$msg_id" =~ ^[0-9]+$ ]]; then
-        log "✗ No messages found with subject: $subject"
+        log "✗ No messages found with subject: $subject after $MAX_RETRIES attempts (${CHECK_IMAP_ELAPSED}s)"
         return 1
     fi
     
@@ -244,6 +259,7 @@ check_imap() {
             debug "Delete retry attempt $attempt/$MAX_RETRIES"
             sleep "$current_delay"
             current_delay=$((current_delay * 2))  # Exponential backoff on LOCAL variable
+            [[ $current_delay -gt $MAX_RETRY_DELAY ]] && current_delay=$MAX_RETRY_DELAY
         fi
         
         local delete_result
@@ -302,14 +318,15 @@ process_test() {
     log "Generated Subject: $subject"
     log "========================================"
     
+    CHECK_IMAP_ELAPSED=0
     if send_email "$host" "$port" "$smtp_user" "$smtp_pass" "$subject" "$tls_mode"; then
         if check_imap "$subject"; then
-            local msg="SUCCESS: Email round-trip completed via $host:$port (${WAIT_TIME}s delay)"
+            local msg="SUCCESS: Email round-trip completed via $host:$port (received in ~${CHECK_IMAP_ELAPSED}s)"
             log "$msg"
             echo "$msg"
             return 0
         fi
-        local msg="FAILED: Email sent but not received within ${WAIT_TIME}s"
+        local msg="FAILED: Email sent but not received within ${CHECK_IMAP_ELAPSED}s ($MAX_RETRIES attempts)"
         log "$msg"
         echo "$msg"
         return 1
@@ -323,10 +340,15 @@ process_test() {
 handle_request() {
     local request host="" port="" smtp_user="" smtp_pass="" tls_mode=""
     
-    read -r request
+    if ! read -t "$READ_TIMEOUT" -r request; then
+        log "⚠ Timed out or EOF reading request line after ${READ_TIMEOUT}s; closing connection"
+        local body="ERROR: Request timed out"
+        printf "HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: ${#body}\r\nConnection: close\r\n\r\n%s" "$body"
+        return
+    fi
     log "HTTP Request: $request"
-    
-    while read -r line; do
+
+    while read -t "$READ_TIMEOUT" -r line; do
         line="${line%$'\r'}"
         [[ -z "$line" ]] && break
     done
@@ -374,9 +396,10 @@ start_server() {
     log "IMAP: $IMAP_USER @ imaps://$IMAP_HOST:$IMAP_PORT"
     log "Wait time: ${WAIT_TIME}s"
     log "Max retries: $MAX_RETRIES"
-    log "Retry delay: ${RETRY_DELAY}s (exponential backoff)"
+    log "Retry delay: ${RETRY_DELAY}s (exponential backoff, capped at ${MAX_RETRY_DELAY}s)"
     log "SMTP timeout: ${SMTP_TIMEOUT}s"
     log "IMAP timeout: ${IMAP_TIMEOUT}s"
+    log "Read timeout: ${READ_TIMEOUT}s"
     log "Debug mode: $DEBUG"
     log "Using curl for IMAP"
     log "========================================"
